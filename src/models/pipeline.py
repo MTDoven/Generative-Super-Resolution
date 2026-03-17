@@ -114,9 +114,24 @@ class ImageProjector(nn.Module):
 
 
 def _compute_image_loss(autoencoder, use_tiled_vae, latents, target_images):
+    # Charbonnier loss is a smooth approximation of L1 loss.
+    def charbonnier_loss(pred, target, eps=1e-3):
+        return torch.mean(torch.sqrt((pred - target)**2 + eps**2))
+    # Gradient loss to enhance edge sharpness, crucial for text clarity in super-resolution
+    def gradient_loss(pred, target):
+        pred_dx = torch.abs(pred[:, :, :, :-1] - pred[:, :, :, 1:])
+        pred_dy = torch.abs(pred[:, :, :-1, :] - pred[:, :, 1:, :])
+        target_dx = torch.abs(target[:, :, :, :-1] - target[:, :, :, 1:])
+        target_dy = torch.abs(target[:, :, :-1, :] - target[:, :, 1:, :])
+        loss_dx = F.l1_loss(pred_dx, target_dx)
+        loss_dy = F.l1_loss(pred_dy, target_dy)
+        return loss_dx + loss_dy
+    # Decode the latents and compute the combined loss for a single sample
     def _decode_and_loss(latents_slice, target_slice):
         gen = autoencoder(latents_slice, mode="decode", tiled=use_tiled_vae)
-        return F.smooth_l1_loss(gen, target_slice)
+        loss_charbonnier = charbonnier_loss(gen, target_slice)
+        loss_grad = gradient_loss(gen, target_slice)
+        return loss_charbonnier + loss_grad
     # Compute image loss in a memory-efficient way by processing one sample at a time
     image_loss = torch.tensor(0.0, device=latents.device, dtype=latents.dtype)
     b = latents.shape[0]

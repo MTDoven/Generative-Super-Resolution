@@ -16,11 +16,11 @@ def main():
                 "out_image_projector": 512,
             },
             "extra_loss_weight": {
-                "text_encoder": 1.0,
-                "latent": 1.0,
-                "image": 3.0,
+                "text_encoder": 0.1,
+                "latent": 0.2,
+                "image": 0.7,
             },
-            "velocity_scale": 5.0,
+            "velocity_scale": 2.0,
             "use_tiled_vae": True,
         },
         dataset={
@@ -37,13 +37,13 @@ def main():
         trainer={
             "batch_size": 4,
             "num_workers": 4,
-            "lr": 3e-4,
-            "num_epochs": 20,
+            "lr": 1e-3,
+            "num_epochs": 10,
             "save_interval": 1,
             "image_save_path": f"{ROOT_PATH}/example_results",
             "checkpoint_save_path": f"{ROOT_PATH}/output_results",
             "device": "cuda",
-            "gradient_accumulation_steps": 4,
+            "gradient_accumulation_steps": 2,
             "mixed_precision": "bf16",
             "deepspeed_plugin": {
                 "zero_stage": 3,
