@@ -1,0 +1,6 @@
+datasets/pdfs/example/
+datasets/images/*_image/
+checkpoints/
+example_results/
+output_results/
+**/__pycache__/
