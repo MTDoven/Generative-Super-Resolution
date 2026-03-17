@@ -146,7 +146,7 @@ def _compute_image_loss(autoencoder, use_tiled_vae, latents, target_images):
 def _compute_alignment_loss(emb1: torch.Tensor, emb2: torch.Tensor) -> torch.Tensor:
     norm1 = F.normalize(emb1, p=2, dim=-1)
     norm2 = F.normalize(emb2, p=2, dim=-1)
-    sim_matrix = torch.bmm(norm1, norm2.transpose(1, 2))
+    sim_matrix = torch.bmm(norm1, norm2.transpose(1, 2)).clamp(min=-1.0, max=1.0)
     max_sim_1 = sim_matrix.max(dim=2)[0]  # [B, L1]
     max_sim_2 = sim_matrix.max(dim=1)[0]  # [B, L2]
     return (1.0 - max_sim_1).mean() + (1.0 - max_sim_2).mean()
