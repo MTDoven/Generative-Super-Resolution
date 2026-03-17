@@ -1,0 +1,23 @@
+.
+├── hr_image
+│   ├── test
+│   └── train
+├── lr_image
+│   ├── test
+│   └── train
+└── synthdog
+    ├── __pycache__
+    ├── config
+    ├── elements
+    │   └── __pycache__
+    ├── layouts
+    │   └── __pycache__
+    └── resources
+        ├── background
+        ├── corpus
+        ├── font
+        │   ├── en
+        │   ├── ja
+        │   ├── ko
+        │   └── zh
+        └── paper

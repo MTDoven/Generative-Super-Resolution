@@ -3,4 +3,8 @@ datasets/images/*_image/
 checkpoints/
 example_results/
 output_results/
+datasets/images/synthdog/resources
+datasets/images/t*_metadata.jsonl
+
+**/wandb/
 **/__pycache__/
