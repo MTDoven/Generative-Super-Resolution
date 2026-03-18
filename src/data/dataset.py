@@ -38,11 +38,11 @@ class PDFDataset(Dataset):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, metadata_file, image_hw=(512, 512)):
+    def __init__(self, metadata_file, image_hw=(512, 512), split=1.0):
         self.image_hw = image_hw
         metadata_path = Path(metadata_file)
         image_folder = metadata_path.parent
-        split = 'test' if 'test' in metadata_path.name else 'train'
+        mode = 'test' if 'test' in metadata_path.name else 'train'
         self.items = []
         with open(metadata_path, 'r') as f:
             for line in f:
@@ -50,14 +50,15 @@ class ImageDataset(Dataset):
                 file_name = data['file_name']
                 gt = json.loads(data['ground_truth'])
                 text = gt['gt_parse']['text_sequence']
-                hr_path = image_folder / 'hr_image' / split / file_name
-                lr_path = image_folder / 'lr_image' / split / file_name
+                hr_path = image_folder / 'hr_image' / mode / file_name
+                lr_path = image_folder / 'lr_image' / mode / file_name
                 self.items.append({
                     'file_name': file_name,
                     'hr_path': hr_path,
                     'lr_path': lr_path,
                     'text': text
                 })
+        self.items = self.items[:int(len(self.items)*split)]
 
     def __len__(self):
         return len(self.items)
