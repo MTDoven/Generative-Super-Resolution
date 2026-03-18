@@ -1,4 +1,4 @@
-ROOT_PATH = "/root/super_resolution/Edit-SR"
+ROOT_PATH = "/root/super_resolution/Reconstruct"
 from src.engine import EngineConfig, Engine
 from src.data.dataset import ImageDataset
 
@@ -72,4 +72,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
