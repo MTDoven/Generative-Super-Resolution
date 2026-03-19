@@ -1,5 +1,7 @@
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 accelerate launch train.py \
+  --dataset_base_path ./dataset/text_images \
+  --dataset_metadata_path ./dataset/text_images/metadata_edit_500.csv \
   --model_id_with_origin_paths "black-forest-labs/FLUX.2-klein-base-4B:text_encoder/*.safetensors,black-forest-labs/FLUX.2-klein-base-4B:transformer/*.safetensors,black-forest-labs/FLUX.2-klein-base-4B:vae/diffusion_pytorch_model.safetensors" \
   --tokenizer_path "black-forest-labs/FLUX.2-klein-base-4B:tokenizer/" \
   --fp8_models "black-forest-labs/FLUX.2-klein-base-4B:text_encoder/*.safetensors,black-forest-labs/FLUX.2-klein-base-4B:transformer/*.safetensors,black-forest-labs/FLUX.2-klein-base-4B:vae/diffusion_pytorch_model.safetensors" \
@@ -11,12 +13,10 @@ accelerate launch train.py \
   --max_pixels 1048576 \
   --use_gradient_checkpointing \
   \
-  --dataset_base_path ./dataset/text_images \
-  --dataset_metadata_path ./dataset/text_images/metadata_tiny.json \
   --dataset_repeat 1 \
   --dataset_num_workers 8 \
-  --output_path "./outputs/train/finetune" \
-  --lora_rank 128 \
+  --output_path "./outputs/train" \
+  --lora_rank 192 \
   --learning_rate 1e-4 \
   --gradient_accumulation_steps 4 \
   --num_epochs 5 \
