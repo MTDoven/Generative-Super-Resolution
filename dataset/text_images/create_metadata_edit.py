@@ -4,12 +4,12 @@ from pathlib import Path
 
 PROMPT_TEMPLATE = (
     'Restore and enhance the low-quality input image to generate a high-resolution, high-quality version. '
-    'The text “{text}” within the image should remain clear, accurate, and unchanged.'
+    'The text within the image should be clear, accurate, and unchanged.'
 )
 
-METADATA_FILE = "/root/super_resolution/Finetune/dataset/text_images/metadata.jsonl"
-EDIT_METADATA_FILE = "/root/super_resolution/Finetune/dataset/text_images/metadata_edit_500.csv"
-LIMIT = 500
+METADATA_FILE = "./metadata.jsonl"
+EDIT_METADATA_FILE = "./metadata_edit_example.csv"
+LIMIT = 300
 
 
 with open(METADATA_FILE, "r", encoding="utf-8") as f:

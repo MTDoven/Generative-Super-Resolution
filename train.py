@@ -1,15 +1,48 @@
 import torch, os, argparse, accelerate
-from diffsynth.core import UnifiedDataset
-from diffsynth.pipelines.flux2_image import Flux2ImagePipeline, ModelConfig
+from diffsynth.core import UnifiedDataset, load_state_dict
+from diffsynth.pipelines.flux2_image_sr import Flux2ImagePipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class Flux2ImageTrainingModule(DiffusionTrainingModule):
+    def merge_trainable_models(self, trainable_models, pipe):
+        models = [] if trainable_models is None or trainable_models == "" else [name for name in trainable_models.split(",") if name != ""]
+        if getattr(pipe, "qwen35_prompt_aligner", None) is not None and "qwen35_prompt_aligner" not in models:
+            models.append("qwen35_prompt_aligner")
+        return ",".join(models) if len(models) > 0 else None
+
+    def load_extra_trainable_modules(self, checkpoint_path):
+        aligner = getattr(self.pipe, "qwen35_prompt_aligner", None)
+        if checkpoint_path is None or aligner is None:
+            return
+
+        state_dict = load_state_dict(checkpoint_path, device="cpu")
+        aligner_state_dict = {}
+        for prefix in ("pipe.qwen35_prompt_aligner.", "qwen35_prompt_aligner."):
+            matched = {
+                key[len(prefix):]: value
+                for key, value in state_dict.items()
+                if key.startswith(prefix)
+            }
+            if len(matched) > 0:
+                aligner_state_dict = matched
+                break
+
+        if len(aligner_state_dict) == 0:
+            return
+
+        load_result = aligner.load_state_dict(aligner_state_dict, strict=False)
+        if len(load_result.missing_keys) > 0:
+            print(f"Warning, missing keys when loading qwen35_prompt_aligner: {load_result.missing_keys}")
+        if len(load_result.unexpected_keys) > 0:
+            print(f"Warning, unexpected keys when loading qwen35_prompt_aligner: {load_result.unexpected_keys}")
+
     def __init__(
         self,
         model_paths=None, model_id_with_origin_paths=None,
-        tokenizer_path=None,
+        # tokenizer_path=None,  # legacy path, disabled
+        qwen35_processor_path=None,
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
@@ -24,8 +57,29 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         super().__init__()
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
-        tokenizer_config = self.parse_path_or_model_id(tokenizer_path, default_value=ModelConfig(model_id="black-forest-labs/FLUX.2-klein-base-4B", origin_file_pattern="tokenizer/"))
-        self.pipe = Flux2ImagePipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config)
+        # tokenizer_config = self.parse_path_or_model_id(tokenizer_path, default_value=ModelConfig(model_id="black-forest-labs/FLUX.2-klein-base-4B", origin_file_pattern="tokenizer/"))
+        tokenizer_config = None
+        if qwen35_processor_path is None:
+            qwen35_processor_config = None
+        elif os.path.exists(qwen35_processor_path):
+            qwen35_processor_config = ModelConfig(path=qwen35_processor_path)
+        elif ":" in qwen35_processor_path:
+            qwen35_processor_config = self.parse_path_or_model_id(qwen35_processor_path)
+        else:
+            qwen35_processor_config = ModelConfig(model_id=qwen35_processor_path, origin_file_pattern=None)
+        self.pipe = Flux2ImagePipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            qwen35_processor_config=qwen35_processor_config,
+        )
+        if qwen35_processor_path is not None and getattr(self.pipe, "text_encoder_qwen35", None) is None:
+            raise ValueError(
+                "Failed to load Qwen3.5 image-text encoder. "
+                "Please ensure `--qwen35_processor_path` points to a valid model repo or local path."
+            )
+        trainable_models = self.merge_trainable_models(trainable_models, self.pipe)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
 
         # Training mode
@@ -35,6 +89,7 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+        self.load_extra_trainable_modules(lora_checkpoint)
         
         # Other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -52,12 +107,17 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         }
         
     def get_pipeline_inputs(self, data):
+        edit_image = data["edit_image"] if "edit_image" in data else None
         inputs_posi = {"prompt": data["prompt"]}
         inputs_nega = {"negative_prompt": ""}
         inputs_shared = {
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
             "input_image": data["image"],
+            "edit_image": edit_image,
+            "edit_image_auto_resize": True,
+            "encode_image": edit_image,
+            "encode_image_auto_resize": True,
             "height": data["image"].size[1],
             "width": data["image"].size[0],
             # Please do not modify the following parameters
@@ -69,6 +129,9 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        # Keep Qwen3.5 image-text input fully aligned with edit-image input.
+        inputs_shared["encode_image"] = inputs_shared.get("edit_image")
+        inputs_shared["encode_image_auto_resize"] = inputs_shared.get("edit_image_auto_resize", True)
         return inputs_shared, inputs_posi, inputs_nega
     
     def forward(self, data, inputs=None):
@@ -84,7 +147,8 @@ def flux2_parser():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser = add_general_config(parser)
     parser = add_image_size_config(parser)
-    parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
+    # parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")  # legacy path, disabled
+    parser.add_argument("--qwen35_processor_path", type=str, default=None, help="Path to Qwen3.5 image-text processor (AutoProcessor).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     return parser
 
@@ -113,7 +177,8 @@ if __name__ == "__main__":
     model = Flux2ImageTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
-        tokenizer_path=args.tokenizer_path,
+        # tokenizer_path=args.tokenizer_path,  # legacy path, disabled
+        qwen35_processor_path=args.qwen35_processor_path,
         trainable_models=args.trainable_models,
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,
