@@ -1,7 +1,7 @@
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 accelerate launch train.py \
   --dataset_base_path ./dataset/text_images \
-  --dataset_metadata_path ./dataset/text_images/metadata_edit_500.csv \
+  --dataset_metadata_path ./dataset/text_images/metadata_edit_example.csv \
   --model_id_with_origin_paths "black-forest-labs/FLUX.2-klein-base-4B:transformer/*.safetensors,black-forest-labs/FLUX.2-klein-base-4B:vae/diffusion_pytorch_model.safetensors" \
   --qwen35_processor_path "./models/Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled" \
   --fp8_models "black-forest-labs/FLUX.2-klein-base-4B:transformer/*.safetensors,black-forest-labs/FLUX.2-klein-base-4B:vae/diffusion_pytorch_model.safetensors" \
