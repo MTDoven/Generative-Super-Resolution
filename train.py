@@ -6,6 +6,25 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class Flux2ImageTrainingModule(DiffusionTrainingModule):
+    def parse_qwen35_vram_config(self, qwen35_processor_path, qwen35_processor_config, fp8_models, offload_models, device):
+        if qwen35_processor_path is None:
+            return None
+        fp8_model_set = set() if fp8_models is None else set(x for x in fp8_models.split(",") if x)
+        offload_model_set = set() if offload_models is None else set(x for x in offload_models.split(",") if x)
+        qwen35_specs = {qwen35_processor_path}
+        if os.path.exists(qwen35_processor_path):
+            qwen35_specs.add(os.path.abspath(qwen35_processor_path))
+        if qwen35_processor_config is not None:
+            if qwen35_processor_config.path is not None:
+                qwen35_specs.add(qwen35_processor_config.path)
+            if qwen35_processor_config.model_id is not None:
+                qwen35_specs.add(qwen35_processor_config.model_id)
+        qwen35_fp8 = any(spec in fp8_model_set for spec in qwen35_specs)
+        qwen35_offload = any(spec in offload_model_set for spec in qwen35_specs)
+        if not qwen35_fp8 and not qwen35_offload:
+            return None
+        return self.parse_vram_config(fp8=qwen35_fp8, offload=qwen35_offload, device=device)
+
     def merge_trainable_models(self, trainable_models, pipe):
         models = [] if trainable_models is None or trainable_models == "" else [name for name in trainable_models.split(",") if name != ""]
         if getattr(pipe, "qwen35_prompt_aligner", None) is not None and "qwen35_prompt_aligner" not in models:
@@ -67,12 +86,20 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
             qwen35_processor_config = self.parse_path_or_model_id(qwen35_processor_path)
         else:
             qwen35_processor_config = ModelConfig(model_id=qwen35_processor_path, origin_file_pattern=None)
+        qwen35_vram_config = self.parse_qwen35_vram_config(
+            qwen35_processor_path=qwen35_processor_path,
+            qwen35_processor_config=qwen35_processor_config,
+            fp8_models=fp8_models,
+            offload_models=offload_models,
+            device=device,
+        )
         self.pipe = Flux2ImagePipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device=device,
             model_configs=model_configs,
             tokenizer_config=tokenizer_config,
             qwen35_processor_config=qwen35_processor_config,
+            qwen35_vram_config=qwen35_vram_config,
         )
         if qwen35_processor_path is not None and getattr(self.pipe, "text_encoder_qwen35", None) is None:
             raise ValueError(

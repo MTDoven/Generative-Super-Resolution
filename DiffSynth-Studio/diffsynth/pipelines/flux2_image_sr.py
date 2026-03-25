@@ -51,6 +51,53 @@ def _imagesr_log(message: str, debug_only: bool = False, once_key: Optional[str]
     print(f"[ImageSR][Qwen35][rank={rank}] {message}", flush=True)
 
 
+def _safe_qwen35_cpu_dtype(dtype: Optional[torch.dtype]) -> torch.dtype:
+    # CPU kernels are more robust with FP32/BF16 than FP16/FP8 for this model.
+    if dtype == torch.bfloat16:
+        return torch.bfloat16
+    return torch.float32
+
+
+def _allow_qwen35_cpu_fallback() -> bool:
+    return os.environ.get("IMAGESR_QWEN35_ALLOW_CPU_FALLBACK", "0") == "1"
+
+
+def _set_attr_if_exists(obj, attr: str, value):
+    if obj is not None and hasattr(obj, attr):
+        try:
+            setattr(obj, attr, value)
+        except Exception:
+            pass
+
+
+def _qwen35_attention_impl_for_device(device) -> str:
+    device_name = str(device).lower()
+    # For GPU inference we prefer SDPA to avoid eager attention's large O(L^2)
+    # memory spike; CPU keeps eager for compatibility.
+    if device_name.startswith("cuda"):
+        return "sdpa"
+    return "eager"
+
+
+def _set_qwen35_attention_impl(model, impl: str):
+    if model is None:
+        return
+
+    candidates = [getattr(model, "config", None)]
+    model_attr = getattr(model, "model", None)
+    if model_attr is not None:
+        candidates.append(getattr(model_attr, "config", None))
+
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        _set_attr_if_exists(cfg, "_attn_implementation", impl)
+        _set_attr_if_exists(cfg, "attn_implementation", impl)
+        text_cfg = getattr(cfg, "text_config", None)
+        _set_attr_if_exists(text_cfg, "_attn_implementation", impl)
+        _set_attr_if_exists(text_cfg, "attn_implementation", impl)
+
+
 def _apply_mistral_regex_fix(tokenizer_or_processor, model_path: str):
     tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
     patch_fn = getattr(type(tokenizer), "_patch_mistral_regex", None)
@@ -88,68 +135,37 @@ def _load_pretrained_quietly(load_fn, model_path: str):
 
 
 class Qwen35PromptAligner(torch.nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, num_groups: int = 8, rank: Optional[int] = 256):
+    def __init__(self, in_dim: int, out_dim: int, num_groups: int = 12, rank: int = 1024):
         super().__init__()
+        assert in_dim % num_groups == 0 and out_dim % num_groups == 0
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.num_groups = num_groups
-        self.rank = rank
-        self.use_grouped_low_rank = (
-            rank > 0 and in_dim % num_groups == 0 and out_dim % num_groups == 0
-        )
+        self.rank = int(rank)
+        self.in_pg = in_dim // num_groups
+        self.out_pg = out_dim // num_groups
 
-        if self.use_grouped_low_rank:
-            self.in_dim_per_group = in_dim // num_groups
-            self.out_dim_per_group = out_dim // num_groups
-            self.layer_mix = torch.nn.Parameter(torch.eye(num_groups))
-            self.input_norms = torch.nn.ModuleList(
-                [torch.nn.LayerNorm(self.in_dim_per_group) for _ in range(num_groups)]
-            )
-            self.down_projs = torch.nn.ModuleList(
-                [torch.nn.Linear(self.in_dim_per_group, rank, bias=False) for _ in range(num_groups)]
-            )
-            self.up_projs = torch.nn.ModuleList(
-                [torch.nn.Linear(rank, self.out_dim_per_group, bias=False) for _ in range(num_groups)]
-            )
-            self.act = torch.nn.SiLU()
+        self.down = torch.nn.Parameter(torch.empty(num_groups, self.in_pg, self.rank))
+        self.mix = torch.nn.Parameter(torch.zeros(num_groups, num_groups, self.rank))
+        self.up = torch.nn.Parameter(torch.empty(num_groups, self.rank, self.out_pg))
 
-            for down_proj, up_proj in zip(self.down_projs, self.up_projs):
-                torch.nn.init.xavier_uniform_(down_proj.weight)
-                torch.nn.init.xavier_uniform_(up_proj.weight)
-        else:
-            self.proj = torch.nn.Linear(in_dim, out_dim, bias=False)
-            if in_dim == out_dim:
-                with torch.no_grad():
-                    self.proj.weight.zero_()
-                    eye_size = min(in_dim, out_dim)
-                    self.proj.weight[:eye_size, :eye_size] = torch.eye(eye_size, dtype=self.proj.weight.dtype)
-            else:
-                torch.nn.init.xavier_uniform_(self.proj.weight)
+        torch.nn.init.xavier_uniform_(self.down)
+        torch.nn.init.xavier_uniform_(self.up)
+        with torch.no_grad():
+            idx = torch.arange(num_groups)
+            self.mix[idx, idx, :] = 1.0
 
     def forward(self, x):
-        if not self.use_grouped_low_rank:
-            return self.proj(x)
-
-        batch_size, seq_len, _ = x.shape
-        x = x.view(batch_size, seq_len, self.num_groups, self.in_dim_per_group)
-        x = torch.einsum("blgi,gh->blhi", x, self.layer_mix)
-
-        aligned_groups = []
-        for group_id in range(self.num_groups):
-            hidden = self.input_norms[group_id](x[:, :, group_id, :])
-            hidden = self.down_projs[group_id](hidden)
-            hidden = self.act(hidden)
-            hidden = self.up_projs[group_id](hidden)
-            aligned_groups.append(hidden)
-
-        return torch.cat(aligned_groups, dim=-1)
-
-    @property
-    def parameter_count(self) -> int:
-        return sum(param.numel() for param in self.parameters())
+        b, l, _ = x.shape
+        x = x.view(b, l, self.num_groups, self.in_pg)
+        z = torch.einsum("blgi,gir->blgr", x, self.down)
+        z = torch.einsum("blgr,ghr->blhr", z, self.mix)
+        y = torch.einsum("blhr,hro->blho", z, self.up)
+        return y.reshape(b, l, self.out_dim)
 
     def _reference_parameter(self):
-        return next(self.parameters())
+        # Used by pipeline runtime to align device/dtype before forward.
+        return self.down
 
 
 class Flux2ImagePipeline(BasePipeline):
@@ -168,6 +184,10 @@ class Flux2ImagePipeline(BasePipeline):
         self.tokenizer: Union[AutoTokenizer, AutoProcessor] = None
         self.processor_qwen35: AutoProcessor = None
         self.qwen35_prompt_aligner: Qwen35PromptAligner = None
+        self.qwen35_storage_dtype = None
+        self.qwen35_storage_device = None
+        self.qwen35_computation_dtype = None
+        self.qwen35_computation_device = None
         self.in_iteration_models = ("dit",)
         self.units = [
             Flux2Unit_ShapeChecker(),
@@ -189,6 +209,7 @@ class Flux2ImagePipeline(BasePipeline):
         tokenizer_config: ModelConfig = ModelConfig(model_id="black-forest-labs/FLUX.2-dev", origin_file_pattern="tokenizer/"),
         vram_limit: float = None,
         qwen35_processor_config: ModelConfig = None,
+        qwen35_vram_config: Optional[dict] = None,
     ):
         # Initialize pipeline
         pipe = Flux2ImagePipeline(device=device, torch_dtype=torch_dtype)
@@ -201,18 +222,68 @@ class Flux2ImagePipeline(BasePipeline):
         pipe.dit = model_pool.fetch_model("flux2_dit")
         pipe.vae = model_pool.fetch_model("flux2_vae")
 
+        qwen35_target_device = pipe.device
+        qwen35_target_dtype = torch_dtype
+        qwen35_compute_device = pipe.device
+        qwen35_compute_dtype = torch_dtype
+        if qwen35_vram_config is not None:
+            qwen35_target_device = qwen35_vram_config.get("onload_device") or qwen35_vram_config.get("computation_device") or pipe.device
+            qwen35_target_dtype = qwen35_vram_config.get("onload_dtype") or qwen35_vram_config.get("computation_dtype") or torch_dtype
+            qwen35_compute_device = qwen35_vram_config.get("computation_device") or pipe.device
+            qwen35_compute_dtype = qwen35_vram_config.get("computation_dtype") or torch_dtype
+            if qwen35_target_device == "disk":
+                qwen35_target_device = "cpu"
+            if qwen35_compute_device == "disk":
+                qwen35_compute_device = "cpu"
+        qwen35_attention_impl = _qwen35_attention_impl_for_device(qwen35_target_device)
+
         # Fallback: load Qwen3.5 image-text encoder directly from Hugging Face / local path.
         if pipe.text_encoder_qwen35 is None and qwen35_processor_config is not None:
             try:
                 qwen35_processor_config.download_if_necessary()
-                pipe.text_encoder_qwen35 = Qwen3_5ForConditionalGeneration.from_pretrained(
-                    qwen35_processor_config.path,
-                    torch_dtype=torch_dtype,
-                )
+                try:
+                    pipe.text_encoder_qwen35 = Qwen3_5ForConditionalGeneration.from_pretrained(
+                        qwen35_processor_config.path,
+                        torch_dtype=torch_dtype,
+                        attn_implementation=qwen35_attention_impl,
+                    )
+                except TypeError:
+                    pipe.text_encoder_qwen35 = Qwen3_5ForConditionalGeneration.from_pretrained(
+                        qwen35_processor_config.path,
+                        torch_dtype=torch_dtype,
+                    )
             except Exception:
                 pipe.text_encoder_qwen35 = None
+        _set_qwen35_attention_impl(pipe.text_encoder_qwen35, qwen35_attention_impl)
+        pipe.qwen35_storage_dtype = qwen35_target_dtype
+        pipe.qwen35_storage_device = qwen35_target_device
+        pipe.qwen35_computation_dtype = qwen35_compute_dtype
+        pipe.qwen35_computation_device = qwen35_compute_device
 
         if pipe.text_encoder_qwen35 is not None:
+            if not (hasattr(pipe.text_encoder_qwen35, "vram_management_enabled") and pipe.text_encoder_qwen35.vram_management_enabled):
+                try:
+                    pipe.text_encoder_qwen35 = pipe.text_encoder_qwen35.to(device=qwen35_target_device, dtype=qwen35_target_dtype)
+                except Exception as error:
+                    if str(qwen35_target_device).startswith("cuda") and not _allow_qwen35_cpu_fallback():
+                        raise RuntimeError(
+                            "Qwen3.5 encoder cannot be moved to CUDA due to OOM. "
+                            "For GPU inference, enable offload for FLUX models via --offload_models. "
+                            "If you still want CPU fallback, set IMAGESR_QWEN35_ALLOW_CPU_FALLBACK=1."
+                        ) from error
+                    cpu_dtype = _safe_qwen35_cpu_dtype(qwen35_target_dtype)
+                    _imagesr_log(
+                        f"Failed to set Qwen3.5 encoder dtype/device to ({qwen35_target_dtype}, {qwen35_target_device}); "
+                        f"fallback to ({cpu_dtype}, cpu). error={type(error).__name__}: {error}",
+                        once_key="qwen35_dtype_device_fallback",
+                    )
+                    pipe.text_encoder_qwen35 = pipe.text_encoder_qwen35.to(device="cpu", dtype=cpu_dtype)
+                    pipe.qwen35_storage_device = "cpu"
+                    pipe.qwen35_computation_device = "cpu"
+                    pipe.qwen35_storage_dtype = cpu_dtype
+                    pipe.qwen35_computation_dtype = cpu_dtype
+                    _set_qwen35_attention_impl(pipe.text_encoder_qwen35, "eager")
+            pipe.text_encoder_qwen35.eval()
             processor_config = qwen35_processor_config if qwen35_processor_config is not None else tokenizer_config
             if processor_config is not None:
                 processor_config.download_if_necessary()
@@ -236,14 +307,28 @@ class Flux2ImagePipeline(BasePipeline):
             qwen_hidden_states_layers = 3  # Must be consistent with Flux2Unit_Qwen35ImageTextEmbedder.num_hidden_state_layers
             in_dim = hidden_size * qwen_hidden_states_layers
             out_dim = pipe.dit.context_embedder.in_features if pipe.dit is not None else in_dim
-            pipe.qwen35_prompt_aligner = Qwen35PromptAligner(in_dim, out_dim).to(device=pipe.device, dtype=pipe.torch_dtype)
+            pipe.qwen35_prompt_aligner = Qwen35PromptAligner(
+                in_dim=in_dim,
+                out_dim=out_dim,
+            ).to(device=pipe.device, dtype=pipe.torch_dtype)
             processor_name = type(pipe.processor_qwen35).__name__ if pipe.processor_qwen35 is not None else None
             tokenizer_name = type(pipe.tokenizer).__name__ if pipe.tokenizer is not None else None
+            try:
+                qwen35_ref_param = next(pipe.text_encoder_qwen35.parameters())
+                qwen35_param_dtype = qwen35_ref_param.dtype
+                qwen35_param_device = qwen35_ref_param.device
+            except StopIteration:
+                qwen35_param_dtype = None
+                qwen35_param_device = None
             _imagesr_log(
                 "Qwen35ImageTextEmbedder loaded successfully "
                 f"(text_encoder={type(pipe.text_encoder_qwen35).__name__}, "
                 f"processor={processor_name}, tokenizer_fallback={tokenizer_name}, "
-                f"aligner={in_dim}->{out_dim}, dtype={pipe.torch_dtype}, device={pipe.device})",
+                f"aligner={in_dim}->{out_dim}, groups={pipe.qwen35_prompt_aligner.num_groups}, "
+                f"rank={pipe.qwen35_prompt_aligner.rank}, "
+                f"qwen35_dtype={qwen35_param_dtype}, "
+                f"qwen35_device={qwen35_param_device}, "
+                f"dtype={pipe.torch_dtype}, device={pipe.device})",
                 once_key="qwen35_loaded_success",
             )
             _imagesr_log(
@@ -362,7 +447,7 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
-            input_params=("encode_image", "encode_image_auto_resize"),
+            input_params=("encode_image", "encode_image_auto_resize", "use_gradient_checkpointing"),
             input_params_posi={"prompt": "prompt"},
             input_params_nega={"prompt": "negative_prompt"},
             output_params=("prompt_emb", "prompt_emb_mask"),
@@ -372,6 +457,9 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
         self.hidden_state_layer_ratios = (1 / 3, 2 / 3, 1.0)
         self._debug_runtime_calls = 0
         self._debug_embed_calls = 0
+        self._qwen35_dtype_switch_debug_calls = 0
+        self._qwen35_gc_enabled = None
+        self.empty_cache_before_qwen = os.environ.get("IMAGESR_QWEN35_EMPTY_CACHE_BEFORE_ENCODE", "1") == "1"
 
     def select_hidden_state_layers(self, hidden_states):
         total_states = len(hidden_states)
@@ -454,6 +542,88 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
             device = torch.device("cpu")
         return dtype, device
 
+    def _switch_qwen35_dtype_device(self, pipe: Flux2ImagePipeline, text_encoder, to_compute: bool):
+        target_dtype = getattr(pipe, "qwen35_computation_dtype", None) if to_compute else getattr(pipe, "qwen35_storage_dtype", None)
+        target_device = getattr(pipe, "qwen35_computation_device", None) if to_compute else getattr(pipe, "qwen35_storage_device", None)
+        if target_dtype is None and target_device is None:
+            return
+        if target_device == "disk":
+            target_device = "cpu"
+        try:
+            ref_param = next(text_encoder.parameters())
+        except StopIteration:
+            return
+        current_dtype, current_device = ref_param.dtype, ref_param.device
+        if target_dtype is None:
+            target_dtype = current_dtype
+        if target_device is None:
+            target_device = current_device
+        if current_dtype == target_dtype and str(current_device) == str(target_device):
+            return
+        try:
+            _set_qwen35_attention_impl(text_encoder, _qwen35_attention_impl_for_device(target_device))
+            text_encoder.to(device=target_device, dtype=target_dtype)
+        except torch.OutOfMemoryError as error:
+            if str(target_device).startswith("cuda") and not _allow_qwen35_cpu_fallback():
+                raise RuntimeError(
+                    "OOM while switching Qwen3.5 encoder to CUDA during inference. "
+                    "Please enable --offload_models for FLUX models to free VRAM, "
+                    "or set IMAGESR_QWEN35_ALLOW_CPU_FALLBACK=1 to allow CPU fallback."
+                ) from error
+            cpu_dtype = _safe_qwen35_cpu_dtype(target_dtype)
+            _imagesr_log(
+                f"OOM while switching Qwen3.5 encoder to ({target_dtype}, {target_device}); "
+                f"fallback to ({cpu_dtype}, cpu). error={error}",
+                once_key="qwen35_runtime_oom_fallback",
+            )
+            text_encoder.to(device="cpu", dtype=cpu_dtype)
+            pipe.qwen35_storage_device = "cpu"
+            pipe.qwen35_computation_device = "cpu"
+            pipe.qwen35_storage_dtype = cpu_dtype
+            pipe.qwen35_computation_dtype = cpu_dtype
+            target_device = "cpu"
+            target_dtype = cpu_dtype
+            _set_qwen35_attention_impl(text_encoder, "eager")
+        self._qwen35_dtype_switch_debug_calls += 1
+        if self._qwen35_dtype_switch_debug_calls <= 10 or self._qwen35_dtype_switch_debug_calls % 50 == 0:
+            _imagesr_log(
+                f"Qwen3.5 dtype/device switched: ({current_dtype}, {current_device}) -> ({target_dtype}, {target_device}), "
+                f"mode={'compute' if to_compute else 'storage'}, call={self._qwen35_dtype_switch_debug_calls}",
+                debug_only=True,
+            )
+
+    def _set_qwen35_gradient_checkpointing(self, text_encoder, enabled: bool):
+        if self._qwen35_gc_enabled is enabled:
+            return
+        if enabled:
+            if hasattr(text_encoder, "gradient_checkpointing_enable"):
+                text_encoder.gradient_checkpointing_enable()
+        else:
+            if hasattr(text_encoder, "gradient_checkpointing_disable"):
+                text_encoder.gradient_checkpointing_disable()
+        self._qwen35_gc_enabled = enabled
+
+    def _forward_qwen35_hidden_states(self, text_encoder, batched_inputs: dict):
+        # We only need hidden states for prompt embeddings. Avoid running lm_head
+        # on full sequence because that can consume ~GBs of extra VRAM.
+        backbone = text_encoder
+        if hasattr(text_encoder, "lm_head") and hasattr(text_encoder, "model"):
+            backbone = text_encoder.model
+        elif hasattr(text_encoder, "model"):
+            model_attr = text_encoder.model
+            if hasattr(model_attr, "lm_head") and hasattr(model_attr, "model"):
+                backbone = model_attr.model
+            else:
+                backbone = model_attr
+
+        output = backbone(
+            **batched_inputs,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        return output
+
     def _build_system_prompt(self) -> str:
         return QWEN35_IMAGE_SR_SYSTEM_PROMPT
 
@@ -478,8 +648,45 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
         return (
             f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
             f"<|im_start|>user\n{user_content}<|im_end|>\n"
-            f"<|im_start|>assistant\n<think>\n"
+            f"<|im_start|>assistant\n"
         )
+
+    def _preview_text_for_log(self, text: str, max_chars: int = 240) -> str:
+        if text is None:
+            return "None"
+        text = text.replace("\n", "\\n")
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "...(truncated)"
+
+    def _get_tokenizer_pad_id(self, tokenizer_or_processor):
+        tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        return 0 if pad_id is None else int(pad_id)
+
+    def _concat_with_dynamic_padding(self, key: str, values: List[torch.Tensor], tokenizer_or_processor):
+        if len(values) == 0:
+            return None
+        if key not in ("input_ids", "attention_mask", "token_type_ids", "position_ids"):
+            return torch.cat(values, dim=0)
+
+        max_len = max(int(v.shape[1]) for v in values)
+        if key == "input_ids":
+            pad_value = self._get_tokenizer_pad_id(tokenizer_or_processor)
+        elif key == "attention_mask":
+            pad_value = 0
+        else:
+            pad_value = 0
+
+        padded = []
+        for v in values:
+            cur_len = int(v.shape[1])
+            if cur_len < max_len:
+                pad_shape = (v.shape[0], max_len - cur_len) + tuple(v.shape[2:])
+                pad_tensor = torch.full(pad_shape, pad_value, dtype=v.dtype, device=v.device)
+                v = torch.cat([v, pad_tensor], dim=1)
+            padded.append(v)
+        return torch.cat(padded, dim=0)
 
     def _build_text_inputs(self, tokenizer, prompt: str, max_sequence_length: int):
         messages = self._build_text_messages(prompt)
@@ -497,13 +704,46 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
                 add_generation_prompt=True,
             )
 
-        return tokenizer(
+        inputs = tokenizer(
             text,
             return_tensors="pt",
-            padding="max_length",
+            padding=False,
             truncation=True,
             max_length=max_sequence_length,
         )
+        input_ids = inputs.get("input_ids")
+        seq_len = int(input_ids.shape[-1]) if torch.is_tensor(input_ids) else None
+
+        image_token_id = getattr(tokenizer, "image_token_id", None)
+        image_token_count = 0
+        if image_token_id is not None and torch.is_tensor(input_ids):
+            image_token_count = int((input_ids == image_token_id).sum().item())
+        text_token_count = (seq_len - image_token_count) if seq_len is not None else None
+
+        seq_len_untruncated = None
+        truncated = None
+        try:
+            untruncated_inputs = tokenizer(
+                text,
+                return_tensors="pt",
+                padding=False,
+                truncation=False,
+            )
+            untruncated_ids = untruncated_inputs.get("input_ids")
+            if torch.is_tensor(untruncated_ids):
+                seq_len_untruncated = int(untruncated_ids.shape[-1])
+                truncated = seq_len_untruncated > (seq_len or 0)
+        except Exception:
+            truncated = None
+
+        _imagesr_log(
+            f"[Tokenizer][Text] prompt_chars={len(prompt)}, max_len={max_sequence_length}, "
+            f"seq_len_out={seq_len}, seq_len_untruncated={seq_len_untruncated}, truncated={truncated}, "
+            f"text_tokens={text_token_count}, image_tokens={image_token_count}, "
+            f"input_preview='{self._preview_text_for_log(text)}'",
+            debug_only=True,
+        )
+        return inputs
 
     def _build_image_text_inputs(self, processor, prompt: str, images: Optional[List[Image.Image]], max_sequence_length: int):
         if images is None:
@@ -528,11 +768,11 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
                 "return_tensors": "pt",
             }
             if truncation:
-                processor_kwargs["padding"] = "max_length"
+                processor_kwargs["padding"] = False
                 processor_kwargs["truncation"] = True
                 processor_kwargs["max_length"] = max_sequence_length
             else:
-                processor_kwargs["padding"] = True
+                processor_kwargs["padding"] = False
                 processor_kwargs["truncation"] = False
             return processor(**processor_kwargs)
 
@@ -551,6 +791,13 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            text = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
         except Exception:
             text = None
@@ -560,17 +807,20 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
             text = build_fallback_text()
             fallback_used = True
 
+        truncation_applied = True
         try:
             inputs = run_processor(text, truncation=True)
         except ValueError as error:
             if "Mismatch in `image` token count" in str(error):
                 inputs = run_processor(text, truncation=False)
+                truncation_applied = False
                 _imagesr_log(
                     f"Retry without truncation due image token mismatch. prompt_len={len(prompt)}, num_images={len(images)}",
                     debug_only=True,
                 )
             else:
                 raise
+        final_text = text
         input_ids = inputs.get("input_ids")
         image_token_id = getattr(tokenizer, "image_token_id", None)
 
@@ -580,24 +830,43 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
                 fallback_text = build_fallback_text()
                 try:
                     inputs = run_processor(fallback_text, truncation=True)
+                    truncation_applied = True
                 except ValueError as error:
                     if "Mismatch in `image` token count" in str(error):
                         inputs = run_processor(fallback_text, truncation=False)
+                        truncation_applied = False
                     else:
                         raise
                 fallback_used = True
+                final_text = fallback_text
                 input_ids = inputs.get("input_ids")
                 image_token_count = int((input_ids == image_token_id).sum().item()) if torch.is_tensor(input_ids) else -1
-            _imagesr_log(
-                f"_build_image_text_inputs: fallback_used={fallback_used}, image_token_count={image_token_count}, "
-                f"input_ids_shape={tuple(input_ids.shape) if torch.is_tensor(input_ids) else None}",
-                debug_only=True,
-            )
         else:
-            _imagesr_log(
-                f"_build_image_text_inputs: fallback_used={fallback_used}, image_token_id unavailable.",
-                debug_only=True,
-            )
+            image_token_count = None
+
+        seq_len = int(input_ids.shape[-1]) if torch.is_tensor(input_ids) else None
+        text_token_count = None if seq_len is None else (seq_len - (image_token_count or 0))
+        seq_len_untruncated = None
+        truncated = None
+        if truncation_applied:
+            try:
+                untruncated_inputs = run_processor(final_text, truncation=False)
+                untruncated_ids = untruncated_inputs.get("input_ids")
+                if torch.is_tensor(untruncated_ids):
+                    seq_len_untruncated = int(untruncated_ids.shape[-1])
+                    truncated = seq_len_untruncated > (seq_len or 0)
+            except Exception:
+                truncated = None
+        else:
+            truncated = False
+
+        _imagesr_log(
+            f"[Tokenizer][ImageText] prompt_chars={len(prompt)}, num_images={len(images)}, max_len={max_sequence_length}, "
+            f"seq_len_out={seq_len}, seq_len_untruncated={seq_len_untruncated}, truncated={truncated}, "
+            f"text_tokens={text_token_count}, image_tokens={image_token_count}, fallback_used={fallback_used}, "
+            f"input_preview='{self._preview_text_for_log(final_text)}'",
+            debug_only=True,
+        )
 
         return inputs
 
@@ -609,7 +878,7 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
         encode_images: Optional[List[Image.Image]],
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
-        max_sequence_length: int = 2048,
+        max_sequence_length: int = 4096,
     ):
         dtype, device = self._resolve_dtype_device(text_encoder, dtype=dtype, device=device)
 
@@ -638,15 +907,12 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
                     batched_inputs.setdefault(key, []).append(value)
 
         batched_inputs = {
-            key: torch.cat(values, dim=0).to(device)
+            key: self._concat_with_dynamic_padding(key, values, tokenizer).to(device)
             for key, values in batched_inputs.items()
         }
 
-        output = text_encoder(
-            **batched_inputs,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        with torch.no_grad():
+            output = self._forward_qwen35_hidden_states(text_encoder, batched_inputs)
 
         hidden_states = output.hidden_states
         layers = self.select_hidden_state_layers(hidden_states)
@@ -657,8 +923,11 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
         prompt_embeds = out.permute(0, 2, 1, 3).reshape(bsz, seq_len, channels * hidden_dim)
         self._debug_embed_calls += 1
         if self._debug_embed_calls <= 5 or self._debug_embed_calls % 50 == 0:
+            input_ids = batched_inputs.get("input_ids")
+            input_seq_len = int(input_ids.shape[-1]) if torch.is_tensor(input_ids) else None
             _imagesr_log(
                 f"get_qwen35_prompt_embeds call={self._debug_embed_calls}: "
+                f"input_seq_len={input_seq_len}, output_seq_len={seq_len}, "
                 f"prompt_embeds_shape={tuple(prompt_embeds.shape)}, dtype={prompt_embeds.dtype}, device={prompt_embeds.device}",
                 debug_only=True,
             )
@@ -692,7 +961,7 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
         device: Optional[torch.device] = None,
         num_images_per_prompt: int = 1,
         prompt_embeds: Optional[torch.Tensor] = None,
-        max_sequence_length: int = 2048,
+        max_sequence_length: int = 4096,
     ):
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
@@ -716,10 +985,11 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
         text_ids = self.prepare_text_ids(prompt_embeds).to(device)
         return prompt_embeds, text_ids
 
-    def process(self, pipe: Flux2ImagePipeline, prompt, encode_image, encode_image_auto_resize):
+    def process(self, pipe: Flux2ImagePipeline, prompt, encode_image, encode_image_auto_resize, use_gradient_checkpointing=None):
         text_encoder_qwen35 = getattr(pipe, "text_encoder_qwen35", None)
         if text_encoder_qwen35 is None:
             return {}
+        use_gradient_checkpointing = bool(use_gradient_checkpointing)
 
         processor = getattr(pipe, "processor_qwen35", None)
         if processor is None:
@@ -745,15 +1015,35 @@ class Flux2Unit_Qwen35ImageTextEmbedder(PipelineUnit):
             )
 
         pipe.load_models_to_device(self.onload_model_names)
-        prompt_embeds, text_ids = self.encode_prompt(
-            text_encoder=text_encoder_qwen35,
-            tokenizer=processor,
-            prompt=prompt,
-            encode_image=encode_image,
-            encode_image_auto_resize=encode_image_auto_resize,
+        # Keep Qwen3.5 weights in storage dtype (e.g. FP8), but run forward in
+        # computation dtype (e.g. BF16) to avoid unsupported FP8 kernels.
+        self._switch_qwen35_dtype_device(pipe, text_encoder_qwen35, to_compute=True)
+        self._set_qwen35_gradient_checkpointing(text_encoder_qwen35, enabled=use_gradient_checkpointing)
+        if (
+            use_gradient_checkpointing
+            and self.empty_cache_before_qwen
+            and str(pipe.device).startswith("cuda")
+        ):
+            torch.cuda.empty_cache()
+        # Keep tokenizer inputs on the actual Qwen3.5 encoder device to avoid
+        # cross-device index_select errors under VRAM/offload mode.
+        encoder_dtype, encoder_device = self._resolve_dtype_device(
+            text_encoder_qwen35,
             dtype=pipe.torch_dtype,
-            device=pipe.device,
+            device=None,
         )
+        try:
+            prompt_embeds, text_ids = self.encode_prompt(
+                text_encoder=text_encoder_qwen35,
+                tokenizer=processor,
+                prompt=prompt,
+                encode_image=encode_image,
+                encode_image_auto_resize=encode_image_auto_resize,
+                dtype=encoder_dtype,
+                device=encoder_device,
+            )
+        finally:
+            self._switch_qwen35_dtype_device(pipe, text_encoder_qwen35, to_compute=False)
 
         aligner = getattr(pipe, "qwen35_prompt_aligner", None)
         if aligner is not None:

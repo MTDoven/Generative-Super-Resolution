@@ -23,8 +23,49 @@ def launch_training_task(
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
         num_epochs = args.num_epochs
-    
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+        optimizer_name = getattr(args, "optimizer", "adamw")
+    else:
+        optimizer_name = "adamw"
+
+    if optimizer_name == "adamw8bit":
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+            if accelerator.is_main_process:
+                print("[Train] Using optimizer: bitsandbytes AdamW8bit")
+        except Exception as error:
+            optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+            if accelerator.is_main_process:
+                print(f"[Train] Failed to enable AdamW8bit ({type(error).__name__}: {error}), fallback to torch AdamW.")
+    elif optimizer_name == "paged_adamw":
+        try:
+            import bitsandbytes as bnb
+            paged_adamw_cls = getattr(bnb.optim, "PagedAdamW32bit", None)
+            if paged_adamw_cls is None:
+                paged_adamw_cls = getattr(bnb.optim, "PagedAdamW", None)
+            if paged_adamw_cls is None:
+                raise AttributeError("bitsandbytes.optim has no PagedAdamW32bit/PagedAdamW")
+            optimizer = paged_adamw_cls(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+            if accelerator.is_main_process:
+                print("[Train] Using optimizer: bitsandbytes PagedAdamW (32-bit, CPU/host paging)")
+        except Exception as error:
+            optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+            if accelerator.is_main_process:
+                print(f"[Train] Failed to enable PagedAdamW ({type(error).__name__}: {error}), fallback to torch AdamW.")
+    elif optimizer_name == "paged_adamw8bit":
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.PagedAdamW8bit(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+            if accelerator.is_main_process:
+                print("[Train] Using optimizer: bitsandbytes PagedAdamW8bit (CPU/host paging)")
+        except Exception as error:
+            optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+            if accelerator.is_main_process:
+                print(f"[Train] Failed to enable PagedAdamW8bit ({type(error).__name__}: {error}), fallback to torch AdamW.")
+    else:
+        optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+        if accelerator.is_main_process:
+            print("[Train] Using optimizer: torch AdamW")
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     model.to(device=accelerator.device)

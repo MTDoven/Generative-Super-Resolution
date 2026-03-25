@@ -2097,13 +2097,17 @@ class Flux2VAE(torch.nn.Module):
 
         return dec
 
+    def _latent_bn_stats(self, device, dtype):
+        running_mean = self.bn.running_mean.view(1, -1, 1, 1).to(device=device, dtype=torch.float32)
+        running_var = self.bn.running_var.view(1, -1, 1, 1).to(device=device, dtype=torch.float32)
+        latents_bn_mean = running_mean.to(dtype=dtype)
+        latents_bn_std = torch.sqrt(running_var + 0.0001).to(dtype=dtype)
+        return latents_bn_mean, latents_bn_std
+
     def decode(
         self, z: torch.FloatTensor, return_dict: bool = True, generator=None
     ):
-        latents_bn_mean = self.bn.running_mean.view(1, -1, 1, 1).to(z.device, z.dtype)
-        latents_bn_std = torch.sqrt(self.bn.running_var.view(1, -1, 1, 1) + 0.0001).to(
-            z.device, z.dtype
-        )
+        latents_bn_mean, latents_bn_std = self._latent_bn_stats(z.device, z.dtype)
         z = z * latents_bn_std + latents_bn_mean
         z = rearrange(z, "B (C P Q) H W -> B C (H P) (W Q)", P=2, Q=2)
         """

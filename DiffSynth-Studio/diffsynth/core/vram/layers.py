@@ -317,6 +317,15 @@ class AutoWrappedLinear(torch.nn.Linear, AutoTorchModule):
             self.disk_offload = True
         else:
             self.disk_offload = False
+
+    def _is_fp8_dtype(self, dtype) -> bool:
+        fp8_dtypes = [
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+        ]
+        return any(d is not None and dtype == d for d in fp8_dtypes)
     
     def fp8_linear(
         self,
@@ -344,13 +353,18 @@ class AutoWrappedLinear(torch.nn.Linear, AutoTorchModule):
         weight = weight.to(self.computation_dtype)
         bias = bias.to(torch.bfloat16)
 
+        out_dtype = origin_dtype
+        if self._is_fp8_dtype(origin_dtype):
+            # Keep activations in BF16 when input unexpectedly becomes FP8.
+            out_dtype = torch.bfloat16
+
         result = torch._scaled_mm(
             input,
             weight.T,
             scale_a=scale_a,
             scale_b=scale_b.T,
             bias=bias,
-            out_dtype=origin_dtype,
+            out_dtype=out_dtype,
         )
         new_shape = origin_shape[:-1] + result.shape[-1:]
         result = result.reshape(new_shape)
@@ -415,16 +429,27 @@ class AutoWrappedLinear(torch.nn.Linear, AutoTorchModule):
         return out
 
     def lora_forward(self, x, out):
+        # CUDA add on FP8 tensors is not always available. Accumulate LoRA in BF16
+        # when either branch is FP8 to keep FP8-storage + BF16-compute stable.
+        needs_bf16_accum = self._is_fp8_dtype(x.dtype) or self._is_fp8_dtype(out.dtype)
+        lora_dtype = torch.bfloat16 if needs_bf16_accum else out.dtype
+        x_lora = x if x.dtype == lora_dtype else x.to(dtype=lora_dtype)
+        out_lora = out if out.dtype == lora_dtype else out.to(dtype=lora_dtype)
+
         if self.lora_merger is None:
             for lora_A, lora_B in zip(self.lora_A_weights, self.lora_B_weights):
-                out = out + x @ lora_A.T @ lora_B.T
+                lora_A = lora_A.to(device=x_lora.device, dtype=lora_dtype)
+                lora_B = lora_B.to(device=x_lora.device, dtype=lora_dtype)
+                out_lora = out_lora + x_lora @ lora_A.T @ lora_B.T
         else:
             lora_output = []
             for lora_A, lora_B in zip(self.lora_A_weights, self.lora_B_weights):
-                lora_output.append(x @ lora_A.T @ lora_B.T)
+                lora_A = lora_A.to(device=x_lora.device, dtype=lora_dtype)
+                lora_B = lora_B.to(device=x_lora.device, dtype=lora_dtype)
+                lora_output.append(x_lora @ lora_A.T @ lora_B.T)
             lora_output = torch.stack(lora_output)
-            out = self.lora_merger(out, lora_output)
-        return out
+            out_lora = self.lora_merger(out_lora, lora_output)
+        return out_lora
     
     def forward(self, x, *args, **kwargs):
         if self.state == 1 and (self.vram_limit is None or self.check_free_vram()):

@@ -285,9 +285,17 @@ def final_resize(img, target_short_range=(256, 512)):
     h, w = img.shape[:2]
     short_edge = min(h, w)
     target_short = random.randint(*target_short_range)
-    
-    scale = target_short / short_edge
-    new_h, new_w = int(h * scale), int(w * scale)
+
+    # Use rounded size to avoid float precision + floor causing 1024 -> 1023.
+    scale = target_short / float(short_edge)
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+
+    # Guarantee exact short edge size requested by args (e.g. 1024).
+    if new_h <= new_w:
+        new_h = target_short
+    if new_w <= new_h:
+        new_w = target_short
     
     # Use random interpolation for final resize
     interpolations = [cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4]
